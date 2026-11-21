@@ -15,6 +15,7 @@ import argparse
 import json
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from dynamics.analyze_c import interval
@@ -28,6 +29,8 @@ HERE = Path(__file__).resolve().parent
 DEVELOPMENT = ("A_seed5", "B_seed5")
 TEST_RECIPES = ("C1", "C2", "C3", "C4", "C5", "C6")
 SANITY = 60.0
+#: Share of tied pairs of one ID row and one OOD row above which a score is marked.
+TIE_LIMIT = 0.01
 LEAD_W = 1.0
 LEAD_M = 0.5
 BELOW_COUNTERPART = 1.0
@@ -49,6 +52,49 @@ def read_results(root: Path, key: str = "metrics") -> pd.DataFrame:
             for score, value in (part.groupby("score")["auroc"].mean() * 100).items():
                 rows.append({"run": out["run"], "recipe": parse_run(out["run"]).recipe,
                              "group": group, "score": score, "auroc": value})
+    return pd.DataFrame(rows)
+
+
+def tied_pairs(ident: np.ndarray, ood: np.ndarray) -> float:
+    """Share of the pairs of one ID row and one OOD row that have the same value."""
+    values, counts = np.unique(ident, return_counts=True)
+    others, other_counts = np.unique(ood, return_counts=True)
+    _, first, second = np.intersect1d(values, others, return_indices=True)
+    return float((counts[first] * other_counts[second]).sum()
+                 / (len(ident) * len(ood)))
+
+
+def tie_shares(root: Path) -> pd.DataFrame:
+    """Per run and new score: the largest share of tied pairs over the far sets.
+
+    An AUROC counts a tied pair as a half. A large share means that the score has
+    lost the order of many rows, for example by a probability that rounds to 1.
+    """
+    rows = []
+    for path in sorted(Path(root).glob("runs/*/probe/scores.npz")):
+        run = path.parent.parent.name
+        saved = np.load(path, allow_pickle=False)
+        sets = [str(name) for name in saved["sets"]]
+        starts = np.r_[0, saved["bounds"][:-1]]
+        layout = {name: slice(int(a), int(b)) for name, a, b
+                  in zip(sets, starts, saved["bounds"], strict=True)}
+        swing = json.loads((path.parent / "results.json").read_text())["swing_rows"]
+        swing_layout, start = {}, 0
+        for name, count in swing.items():
+            swing_layout[name] = slice(start, start + count)
+            start += count
+        for names, values, where in ((saved["names"], saved["values"], layout),
+                                     (saved["swing_names"], saved["swing_values"],
+                                      swing_layout)):
+            for name, row in zip(names, values, strict=True):
+                # The table of the swing rows repeats the other scores: keep D2.
+                if ":" not in str(name) or (
+                        where is swing_layout and not str(name).startswith("D2:")):
+                    continue
+                far = [tied_pairs(row[where["val"]], row[where[ood]])
+                       for ood in FAR_SETS if ood in where]
+                if far:
+                    rows.append({"run": run, "score": str(name), "tied": max(far)})
     return pd.DataFrame(rows)
 
 
@@ -130,6 +176,11 @@ def main() -> None:
     new = [name for name in far.columns if ":" in name]
     sanity = {name: bool((develop[name].dropna() >= SANITY).all())
               for name in (D1,) if name in develop}
+    if not swing.empty:
+        swing_far = wide(swing)
+        swing_develop = swing_far[swing_far.index.isin(DEVELOPMENT)]
+        if D2 in swing_develop and swing_develop[D2].notna().any():
+            sanity[D2] = bool((swing_develop[D2].dropna() >= SANITY).all())
     sections = [("Runs", (
         f"{len(far)} runs with probe results: {len(test)} test runs, "
         f"{len(develop)} development runs.\n\n**Sanity gate (far AUROC of at "
@@ -138,6 +189,16 @@ def main() -> None:
                      for name, ok in sanity.items()) or "no development run")
         + ".\n\n" + block(develop[["recipe", *[n for n in new if n in develop]]]
                           .reset_index(), 1)))]
+    ties = tie_shares(root)
+    if not ties.empty:
+        worst = ties.groupby("score")["tied"].max().sort_values(ascending=False)
+        marked = [name for name, share in worst.items() if share > TIE_LIMIT]
+        sections.append(("Ties", (
+            "Largest share of tied pairs of one ID row and one OOD row, over the "
+            f"runs and the far sets. A share above {TIE_LIMIT:.0%} means that the "
+            "AUROC of the score is not reliable: "
+            + (", ".join(f"**{name}**" for name in marked) if marked else "none")
+            + ".\n\n" + block(worst.rename("tied").reset_index(), 3))))
     if not test.empty:
         summary = regret_summary(test)
         shown = summary.loc[[*new, *summary.loc[[n for n in ALL_CSFS

@@ -12,6 +12,13 @@ Direction 2 (label swing): the test row enters a small context with each label i
 turn. D2 is the negative of log(sum over labels of the probability of the forced
 label). D2-0 is the largest class probability with no added row.
 
+Each score is stored in a form that keeps the order of the rows where a
+probability rounds to 1 (protocol, run record of 2026-11-21): the log-odds for D1
+and D1max, minus the log of the probability of the other classes for D2-0, and D2
+plus the constant log(number of classes). Each form is a monotone function of the
+definition above. The TabPFN probabilities come from the raw logits in double
+precision, because `predict_proba` works in single precision.
+
     python -m dynamics.tabular_probe --only A_seed5 --out-root $DYN_ROOT ...
 
 Protocol: ../documentation/tabular_prior_probe_protocol_2026-11-17.md
@@ -20,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 import traceback
 from collections.abc import Callable
@@ -58,6 +66,15 @@ ROWS_PER_SET = 500
 SWING_ROWS = 250
 CONTEXT_PER_CLASS = 100
 SWING_COLUMNS = (512, 128)
+#: Largest difference between the double precision probabilities and `predict_proba`
+#: that counts as agreement. `predict_proba` works in single precision.
+PRECISION_TOLERANCE = 1e-4
+#: Rows of the comparison with `predict_proba`.
+PRECISION_ROWS = 256
+#: Smallest positive double, the floor under a logarithm.
+TINY = float(np.finfo(np.float64).tiny)
+#: Marks results whose scores keep the order of the rows with a probability near 1.
+SCORE_FORMS = "double precision: log-odds, rest of top class, D2 plus log(classes)"
 Learner = Callable[[], Any]
 
 
@@ -67,6 +84,9 @@ def learner(name: str, device: str, swing: bool = False) -> Learner:
     The label swing uses one estimator, as the protocol fixes.
     """
     if name in VERSIONS:
+        # tabpfn builds the network again at each fit unless this cache is on.
+        os.environ.setdefault("TABPFN_MODEL_CACHE_SIZE", str(len(VERSIONS)))
+
         def make() -> Any:
             from tabpfn import TabPFNClassifier
             from tabpfn.constants import ModelVersion
@@ -116,10 +136,55 @@ def background(train: np.ndarray, count: int, rng: np.random.Generator
     return train[rows, np.arange(train.shape[1])]
 
 
+def probabilities(model: Any, rows: np.ndarray, gaps: list[float] | None = None
+                  ) -> np.ndarray:
+    """Class probabilities of `rows` in double precision, in the order of `classes_`.
+
+    TabPFN applies its softmax in single precision, so a confident model gives
+    exactly 1 to many rows, and their order is lost. Here the raw logits go through
+    the post-processing of the model itself as a double tensor. With `gaps`, the
+    first rows are compared with `predict_proba`: the largest difference is
+    appended, and a difference above the tolerance gives `predict_proba` for all
+    rows. A learner with no raw logits gives `predict_proba`.
+    """
+    raw_logits = getattr(model, "predict_raw_logits", None)
+    convert = getattr(model, "logits_to_probabilities", None)
+    if raw_logits is None or convert is None:
+        return np.asarray(model.predict_proba(rows), dtype=np.float64)
+    raw = torch.from_numpy(np.asarray(raw_logits(rows), dtype=np.float64))
+    exact = np.asarray(convert(raw).detach().cpu().numpy(), dtype=np.float64)
+    if gaps is not None:
+        part = rows[:PRECISION_ROWS]
+        single = np.asarray(model.predict_proba(part), dtype=np.float64)
+        same_shape = exact[:len(part)].shape == single.shape
+        gap = (float(np.abs(exact[:len(part)] - single).max()) if same_shape
+               else float("inf"))
+        gaps.append(gap)
+        if not gap <= PRECISION_TOLERANCE:
+            return np.asarray(model.predict_proba(rows), dtype=np.float64)
+    return exact
+
+
+def log_odds(model: Any, rows: np.ndarray, gaps: list[float] | None = None
+             ) -> np.ndarray:
+    """Log-odds of class 1 against class 0 of a fitted binary learner.
+
+    The value is a monotone function of the probability of class 1. It keeps the
+    order of the rows whose probability rounds to 1.
+    """
+    if not hasattr(model, "predict_raw_logits") and hasattr(model,
+                                                            "decision_function"):
+        return np.asarray(model.decision_function(rows), dtype=np.float64)
+    table = probabilities(model, rows, gaps)
+    classes = list(model.classes_)
+    return (np.log(np.maximum(table[:, classes.index(1)], TINY))
+            - np.log(np.maximum(table[:, classes.index(0)], TINY)))
+
+
 def class_scores(make: Learner, train: np.ndarray, labels: np.ndarray,
-                 queries: np.ndarray, n_classes: int, seed: int = SEED
-                 ) -> np.ndarray:
-    """Per query and class: the probability of "class" against the background."""
+                 queries: np.ndarray, n_classes: int, seed: int = SEED,
+                 gaps: list[float] | None = None) -> np.ndarray:
+    """Per query and class: the log-odds of "class" against the background."""
     out = np.empty((len(queries), n_classes))
     for c in range(n_classes):
         positive = train[labels == c]
@@ -128,7 +193,7 @@ def class_scores(make: Learner, train: np.ndarray, labels: np.ndarray,
         model = make()
         model.fit(np.vstack([positive, reference]),
                   np.r_[np.ones(len(positive), int), np.zeros(len(reference), int)])
-        out[:, c] = model.predict_proba(queries)[:, list(model.classes_).index(1)]
+        out[:, c] = log_odds(model, queries, gaps)
     return out
 
 
@@ -142,29 +207,46 @@ def balanced_context(labels: np.ndarray, n_classes: int,
         for c in range(n_classes)]))
 
 
+def rest_of(table: np.ndarray, kept: np.ndarray) -> np.ndarray:
+    """Per row: the summed probability of every class except the one in `kept`."""
+    others = table.copy()
+    others[np.arange(len(table)), kept] = 0.0
+    return others.sum(axis=1)
+
+
 def plain_scores(make: Learner, context: np.ndarray, labels: np.ndarray,
-                 queries: np.ndarray) -> np.ndarray:
-    """D2-0: the largest class probability with no added row."""
+                 queries: np.ndarray, gaps: list[float] | None = None) -> np.ndarray:
+    """D2-0: minus the log of the probability that the top class leaves to the others.
+
+    The value is a monotone function of the largest class probability with no added
+    row. It keeps the order of the rows whose top probability rounds to 1.
+    """
     model = make()
     model.fit(context, labels)
-    return model.predict_proba(queries).max(axis=1)
+    table = probabilities(model, queries, gaps)
+    rest = rest_of(table, table.argmax(axis=1))
+    return -np.log(np.maximum(rest, TINY))
 
 
 def swing_scores(make: Learner, context: np.ndarray, labels: np.ndarray,
                  queries: np.ndarray, n_classes: int) -> np.ndarray:
-    """D2: minus log(sum over labels of the probability of the forced label).
+    """D2 plus log(n_classes): minus log(mean over labels of the forced probability).
 
-    Each query enters the context once for each label. The value is 0 if only one
-    label can be given to the row, and -log(n_classes) if every label is accepted.
+    Each query enters the context once for each label. The value is log(n_classes)
+    if only one label can be given to the row, and 0 if every label is accepted.
+    The sum of the forced probabilities is close to n_classes for most rows, so the
+    code adds up the deficits, which keep the order of those rows.
     """
     out = np.empty(len(queries))
     for i, row in enumerate(queries):
-        forced = 0.0
+        deficit = 0.0
         for y in range(n_classes):
             model = make()
             model.fit(np.vstack([context, row]), np.r_[labels, y])
-            forced += model.predict_proba(row[None])[0, list(model.classes_).index(y)]
-        out[i] = -np.log(forced)
+            table = probabilities(model, row[None])
+            forced = np.array([list(model.classes_).index(y)])
+            deficit += float(rest_of(table, forced)[0])
+        out[i] = -np.log1p(-min(deficit / n_classes, 1.0 - 1e-16))
     return out
 
 
@@ -186,6 +268,18 @@ def reduce_columns(train: np.ndarray, columns: int) -> Callable[[np.ndarray], An
     from sklearn.decomposition import PCA
 
     return PCA(n_components=columns, random_state=SEED).fit(train).transform
+
+
+def note_gaps(name: str, found: list[float], gaps: dict[str, float],
+              errors: dict[str, str]) -> None:
+    """Record the comparison with `predict_proba`, and a fallback as an error."""
+    if not found:
+        return
+    gaps[name] = max(found)
+    if not gaps[name] <= PRECISION_TOLERANCE:
+        errors[f"precision:{name}"] = (
+            f"double precision differs from predict_proba by {gaps[name]:.3g}, "
+            "so predict_proba was used")
 
 
 def probe_run(spec: RunSpec, paths: DataPaths, out_root: Path, device: torch.device,
@@ -226,27 +320,33 @@ def probe_run(spec: RunSpec, paths: DataPaths, out_root: Path, device: torch.dev
     x_probe = probe.double().numpy()
     predicted = logits.argmax(dim=1).numpy()
     timing: dict[str, float] = {}
+    gaps: dict[str, float] = {}
     for name in learners:
         began = time.time()
+        found: list[float] = []
         try:
             table = class_scores(learner(name, str(device)), x_train, y_train,
-                                 x_probe, n_classes)
+                                 x_probe, n_classes, gaps=found)
             scores[f"D1:{name}"] = table[np.arange(len(table)), predicted]
             scores[f"D1max:{name}"] = table.max(axis=1)
         except Exception as error:  # noqa: BLE001 - keep the other scores
             errors[f"D1:{name}"] = f"{type(error).__name__}: {error}"
             print(traceback.format_exc(), flush=True)
+        note_gaps(f"D1:{name}", found, gaps, errors)
         timing[f"D1:{name}"] = round(time.time() - began, 1)
     context = balanced_context(y_train, n_classes)
     reduce = reduce_columns(x_train, swing_columns)
     x_context, y_context = reduce(x_train[context]), y_train[context]
     for name in plain:
         began = time.time()
+        found = []
         try:
             scores[f"D2-0:{name}"] = plain_scores(
-                learner(name, str(device)), x_context, y_context, reduce(x_probe))
+                learner(name, str(device)), x_context, y_context, reduce(x_probe),
+                gaps=found)
         except Exception as error:  # noqa: BLE001
             errors[f"D2-0:{name}"] = f"{type(error).__name__}: {error}"
+        note_gaps(f"D2-0:{name}", found, gaps, errors)
         timing[f"D2-0:{name}"] = round(time.time() - began, 1)
     # The label swing runs on fewer rows: evenly spaced rows of val and of each
     # far set. The rows of val are in class order, so the classes stay balanced.
@@ -271,18 +371,20 @@ def probe_run(spec: RunSpec, paths: DataPaths, out_root: Path, device: torch.dev
         timing[f"D2:{name}"] = round(time.time() - began, 1)
     np.savez_compressed(
         folder / "probe" / "scores.npz", names=np.array(list(scores)),
-        values=np.stack(list(scores.values())).astype(np.float32),
+        values=np.stack(list(scores.values())).astype(np.float64),
         sets=np.array(order), bounds=np.array([layout[name].stop for name in order]),
         correct=correct, swing_rows=chosen,
         swing_names=np.array(list(swing_scores_by_name)),
-        swing_values=np.stack(list(swing_scores_by_name.values())).astype(np.float32))
+        swing_values=np.stack(list(swing_scores_by_name.values())).astype(np.float64))
     return {
         "run": spec.name, "epoch": epoch, "n_classes": n_classes,
         "rows": {name: len(rows[name]) for name in order},
         "swing_rows": {name: s.stop - s.start for name, s in swing_layout.items()},
         "settings": {"learners": learners, "plain": plain, "swing": swing,
                      "swing_columns": swing_columns,
-                     "context_per_class": CONTEXT_PER_CLASS, "seed": SEED},
+                     "context_per_class": CONTEXT_PER_CLASS, "seed": SEED,
+                     "score_forms": SCORE_FORMS},
+        "precision_gaps": gaps,
         "metrics": metric_rows(scores, layout, correct),
         "swing_metrics": metric_rows(swing_scores_by_name, swing_layout,
                                      correct[chosen[:swing_layout["val"].stop]]),

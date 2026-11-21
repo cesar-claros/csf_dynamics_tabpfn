@@ -521,26 +521,34 @@ python -m dynamics.check_probe_env --load
 export PROBE_ARGS="--out-root $DYN_ROOT --imagenette-dir $IMAGENETTE_DIR --imagewoof-dir $IMAGEWOOF_DIR --textures-dir $TEXTURES_DIR --extra-set inaturalist=$OOD/inaturalist --extra-set places=$OOD/places --extra-set sun=$OOD/sun --extra-set openimage_o=$OOD/openimage_o --extra-set ssb_hard=$OOD/ssb_hard --extra-set ninco=$OOD/ninco"
 ```
 
-**4. Time gate.** It prints the seconds for one pass of the label swing with 512 and with 128 columns. The limit is 0.1 second:
+**4. Time gate.** It prints the seconds for one pass of the label swing with 512 and with 128 columns. The limit is 0.1 second. The probe turns on the model cache of `tabpfn` (`TABPFN_MODEL_CACHE_SIZE`), unless the variable is set, because `tabpfn` builds the network again at each fit without it:
 
 ```bash
 python -m dynamics.tabular_probe --only A_seed5 --measure $PROBE_ARGS
 ```
 
-**5. Development runs,** with the label swing of all three versions. Add `--swing-columns 128` here and below if the time gate asks for it:
+**5. Development runs,** with the label swing of all three versions. The time gate of 2026-11-21 fixed 128 columns and 125 rows for the label swing (protocol, run record), so the commands here and below carry `--swing-columns 128 --swing-rows 125`:
 
 ```bash
-nohup python -m dynamics.tabular_probe --only A_seed5 B_seed5 --swing tabpfn_v3.5 tabpfn_v3 tabpfn_v2.5 $PROBE_ARGS > dyn_probe_dev.log 2>&1 &
+nohup python -m dynamics.tabular_probe --only A_seed5 B_seed5 --swing tabpfn_v3.5 tabpfn_v3 tabpfn_v2.5 --swing-columns 128 --swing-rows 125 $PROBE_ARGS > dyn_probe_dev.log 2>&1 &
 ```
+
+A run that has results is skipped. To compute it again, add `--force`. This command repeats the two development runs with no label swing, in about 10 minutes for each run:
+
+```bash
+nohup python -m dynamics.tabular_probe --only A_seed5 B_seed5 --swing --force $PROBE_ARGS > dyn_probe_dev2.log 2>&1 &
+```
+
+The log line of a run counts its errors. An entry `precision:<score>` in the errors of `results.json` means that the double precision probabilities did not agree with `predict_proba` of `tabpfn`, and that the score used `predict_proba`. Such a score can have ties.
 
 **6. Test runs,** after the settings are frozen in the protocol. Seed 0 has the label swing of all versions, seed 1 of TabPFN-3.5 only, and the other runs have none:
 
 ```bash
-nohup python -m dynamics.tabular_probe --only C1_seed0 C2_seed0 C3_seed0 C4_seed0 C5_seed0 C6_seed0 --swing tabpfn_v3.5 tabpfn_v3 tabpfn_v2.5 $PROBE_ARGS > dyn_probe_s0.log 2>&1 &
+nohup python -m dynamics.tabular_probe --only C1_seed0 C2_seed0 C3_seed0 C4_seed0 C5_seed0 C6_seed0 --swing tabpfn_v3.5 tabpfn_v3 tabpfn_v2.5 --swing-columns 128 --swing-rows 125 $PROBE_ARGS > dyn_probe_s0.log 2>&1 &
 ```
 
 ```bash
-nohup python -m dynamics.tabular_probe --only C1_seed1 C2_seed1 C3_seed1 C4_seed1 C5_seed1 C6_seed1 $PROBE_ARGS > dyn_probe_s1.log 2>&1 &
+nohup python -m dynamics.tabular_probe --only C1_seed1 C2_seed1 C3_seed1 C4_seed1 C5_seed1 C6_seed1 --swing-columns 128 --swing-rows 125 $PROBE_ARGS > dyn_probe_s1.log 2>&1 &
 ```
 
 ```bash
@@ -556,6 +564,10 @@ Local analysis, after `tar xzf dyn_probe.tgz -C dyn_results`. The report goes to
 ```bash
 uv run python -m dynamics.analyze_probe --results-root dyn_results
 ```
+
+The report has a section "Ties". It gives, for each new score, the largest share of pairs of one ID row and one OOD row with the same value. An AUROC counts a tied pair as a half, so a share above 1% marks a score whose AUROC is not reliable.
+
+**Form of the stored scores.** `tabpfn` applies its softmax in single precision, and TabPFN-3 and TabPFN-3.5 then give exactly 1 to many rows. So the probe takes the raw logits, applies the post-processing of `tabpfn` in double precision, and stores each score in a form that keeps the order of those rows: the log-odds for D1 and D1-max, minus the log of the probability of the other classes for D2-0, and D2 plus the constant log(number of classes). Each form is a monotone function of the score of the protocol, so the AUROC is the one of the planned score with no ties. Results of this code have `score_forms` in their settings. The first development results (2026-11-21) do not have it.
 
 ### Reference check on saved checkpoints
 

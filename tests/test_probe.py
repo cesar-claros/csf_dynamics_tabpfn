@@ -2,6 +2,7 @@ import json
 
 import numpy as np
 import pytest
+import torch
 
 from dynamics import analyze_probe, run_stage
 from dynamics import tabular_probe as tp
@@ -45,9 +46,10 @@ def test_class_scores_prefer_the_own_class():
     x, y = clusters()
     queries = np.array([[6.0, 0, 0, 0], [0, 6.0, 0, 0], [0, 0, 6.0, 0]])
     table = tp.class_scores(tp.learner("trees", "cpu"), x, y, queries, 3)
-    assert table.shape == (3, 3) and ((table >= 0) & (table <= 1)).all()
+    assert table.shape == (3, 3) and np.isfinite(table).all()
     assert (table.argmax(axis=1) == np.arange(3)).all()
-    assert (np.diag(table) > 0.8).all()
+    assert (np.diag(table) > np.log(0.8 / 0.2)).all(), "log-odds of the own class"
+    assert (table[~np.eye(3, dtype=bool)] < 0).all()
 
 
 class KernelClassifier:
@@ -69,12 +71,113 @@ def test_label_swing_is_larger_far_from_the_data():
     x, y = clusters()
     queries = np.array([[6.0, 0, 0, 0], [40.0, 40.0, 40.0, 40.0]])
     inside, far = tp.swing_scores(KernelClassifier, x, y, queries, 3)
-    assert inside == pytest.approx(0.0, abs=0.1), "one label fits, none can be forced"
-    assert far == pytest.approx(-np.log(3), abs=1e-6), "every forced label is accepted"
-    plain = tp.plain_scores(KernelClassifier, x, y, queries[:1])
-    assert plain[0] == pytest.approx(1.0, abs=1e-6)
+    assert inside == pytest.approx(np.log(3), abs=0.1), "one label fits"
+    assert far == pytest.approx(0.0, abs=1e-6), "every forced label is accepted"
+    between = np.array([[6.0, 0, 0, 0], [3.0, 3.0, 0, 0]])
+    plain = tp.plain_scores(KernelClassifier, x, y, between)
+    table = KernelClassifier().fit(x, y).predict_proba(between)
+    assert plain[1] == pytest.approx(-np.log(1 - table[1].max()), rel=1e-6)
+    # At a centre the top probability is 1 minus about 1e-13, and 1 - max is not
+    # exact any more. The score adds up the other classes in its place.
+    assert plain[0] == pytest.approx(-np.log(np.sort(table[0])[:-1].sum()), rel=1e-9)
+    assert plain[0] > plain[1], "the top class leaves less to the others at a centre"
     context = tp.balanced_context(y, 3, per_class=10)
     assert np.bincount(y[context]).tolist() == [10, 10, 10]
+
+
+class SaturatedModel:
+    """A stand-in with the output methods of TabPFN and a single precision softmax.
+
+    One feature is the logit gap between the two classes. `predict_proba` rounds to
+    1 above a gap of about 17, as a softmax in single precision does.
+    """
+
+    classes_ = np.array([0, 1])
+    estimators = 2
+    shift = 0.0
+
+    def fit(self, x: np.ndarray, y: np.ndarray) -> "SaturatedModel":
+        return self
+
+    def predict_raw_logits(self, rows: np.ndarray) -> np.ndarray:
+        gap = rows[:, 0].astype(np.float32)
+        one = np.stack([np.zeros_like(gap), gap], axis=1)
+        return np.stack([one] * self.estimators)
+
+    def logits_to_probabilities(self, raw: torch.Tensor) -> torch.Tensor:
+        return torch.softmax(raw, dim=-1).mean(dim=0)
+
+    def predict_proba(self, rows: np.ndarray) -> np.ndarray:
+        raw = torch.from_numpy(self.predict_raw_logits(rows))
+        return (self.logits_to_probabilities(raw).numpy()
+                + np.array([self.shift, -self.shift], dtype=np.float32))
+
+
+def test_double_precision_keeps_the_order_that_single_precision_loses():
+    rows = np.array([[20.0], [25.0], [30.0], [2.0]])
+    model = SaturatedModel()
+    single = model.predict_proba(rows)[:, 1]
+    assert (single[:3] == 1.0).all(), "single precision ties the confident rows"
+    gaps: list[float] = []
+    table = tp.probabilities(model, rows, gaps)
+    assert table.dtype == np.float64 and gaps[0] < 1e-6
+    assert (np.diff(table[:3, 0]) < 0).all() and (table[:3, 0] > 0).all()
+    assert tp.log_odds(model, rows) == pytest.approx([20.0, 25.0, 30.0, 2.0], rel=1e-5)
+    scores = tp.plain_scores(SaturatedModel, rows, np.array([0, 1, 0, 1]), rows)
+    assert scores == pytest.approx([20.0, 25.0, 30.0, 2.126928], rel=1e-5)
+    assert len(np.unique(scores)) == 4
+
+
+def test_a_mismatch_with_predict_proba_falls_back_and_is_recorded():
+    rows = np.array([[1.0], [2.0]])
+    model = SaturatedModel()
+    model.shift = 0.01
+    gaps: list[float] = []
+    table = tp.probabilities(model, rows, gaps)
+    assert gaps[0] == pytest.approx(0.01, rel=1e-3)
+    assert table == pytest.approx(model.predict_proba(rows))
+    noted: dict[str, float] = {}
+    errors: dict[str, str] = {}
+    tp.note_gaps("D1:stand_in", gaps, noted, errors)
+    assert noted == {"D1:stand_in": gaps[0]} and "precision:D1:stand_in" in errors
+    tp.note_gaps("D1:other", [], noted, errors)
+    tp.note_gaps("D1:fine", [1e-7], noted, errors)
+    assert set(noted) == {"D1:stand_in", "D1:fine"} and len(errors) == 1
+
+
+def test_controls_use_the_decision_function():
+    x, y = clusters()
+    binary = (y == 0).astype(int)
+    model = tp.learner("logistic", "cpu")().fit(x, binary)
+    queries = np.array([[6.0, 0, 0, 0], [60.0, 0, 0, 0], [0, 6.0, 0, 0]])
+    odds = tp.log_odds(model, queries)
+    assert odds == pytest.approx(model.decision_function(queries))
+    assert odds[1] > odds[0] > 0 > odds[2], "no tie for the two confident rows"
+
+
+def test_tied_pairs_and_the_tie_table(tmp_path):
+    assert analyze_probe.tied_pairs(np.array([1.0, 1.0, 0.5]),
+                                    np.array([1.0, 0.2])) == pytest.approx(2 / 6)
+    assert analyze_probe.tied_pairs(np.arange(4.0), np.arange(4.0) + 10) == 0.0
+    folder = tmp_path / "runs" / "A_seed5" / "probe"
+    folder.mkdir(parents=True)
+    rng = np.random.default_rng(0)
+    sets = ["val", "places", "sun"]
+    clean = rng.normal(size=30)
+    tied = np.r_[np.ones(8), rng.normal(size=2), np.ones(5), rng.normal(size=15)]
+    swing = np.r_[np.zeros(4), np.zeros(4)]
+    np.savez_compressed(
+        folder / "scores.npz", names=np.array(["MSR", "D1:trees", "D1:tabpfn_v3"]),
+        values=np.stack([tied, clean, tied]), sets=np.array(sets),
+        bounds=np.array([10, 20, 30]), swing_names=np.array(["D1:trees",
+                                                             "D2:tabpfn_v3"]),
+        swing_values=np.stack([swing, swing]))
+    (folder / "results.json").write_text(json.dumps(
+        {"run": "A_seed5", "swing_rows": {"val": 4, "places": 4}}))
+    table = analyze_probe.tie_shares(tmp_path).set_index("score")["tied"]
+    assert set(table.index) == {"D1:trees", "D1:tabpfn_v3", "D2:tabpfn_v3"}
+    assert table["D1:trees"] == 0.0 and table["D2:tabpfn_v3"] == 1.0
+    assert table["D1:tabpfn_v3"] == pytest.approx(8 * 5 / 100)
 
 
 def test_unknown_learner_and_column_reduction():
@@ -105,6 +208,8 @@ def test_probe_on_a_tiny_run(tiny_data, tmp_path, monkeypatch):
     assert out["rows"]["val"] == 120 and out["rows"]["places"] == 20
     assert out["swing_rows"] == {"val": 4, "places": 4}
     names = {row["score"] for row in out["metrics"]}
+    assert out["settings"]["score_forms"] == tp.SCORE_FORMS
+    assert out["precision_gaps"] == {}, "the controls have no raw logits"
     assert set(ALL_CSFS) <= names
     assert {"D1:logistic", "D1max:logistic", "D2-0:logistic"} <= names
     assert {row["set"] for row in out["metrics"]} == {"places", "ssb_hard",
@@ -112,6 +217,7 @@ def test_probe_on_a_tiny_run(tiny_data, tmp_path, monkeypatch):
     assert "D2:logistic" in {row["score"] for row in out["swing_metrics"]}
     saved = np.load(folder / "scores.npz")
     assert saved["values"].shape == (len(saved["names"]), 120 + 20 + 18 + 60)
+    assert saved["values"].dtype == np.float64
     tp.main()          # a complete run is skipped
 
 
@@ -149,7 +255,7 @@ def test_report_reads_a_lead_and_a_swing_that_adds(tmp_path, monkeypatch):
     analyze_probe.main()
     text = out.read_text()
     assert "20 runs with probe results: 18 test runs, 2 development runs" in text
-    assert "D1:tabpfn_v3.5 pass" in text
+    assert "D1:tabpfn_v3.5 pass, D2:tabpfn_v3.5 pass" in text
     assert "**D1 with TabPFN-3.5: lead:" in text
     assert "gradient-boosted trees: fail:" in text
     assert "12 test runs" in text and "**the swing adds.**" in text
