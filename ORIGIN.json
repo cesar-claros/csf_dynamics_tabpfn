@@ -1,0 +1,19 @@
+{
+  "source_repository": "https://github.com/cesar-claros/csf_dynamics",
+  "source_commit": "d926da10900a1b5a5f13e01d440fd21009cbdaff",
+  "copied_on": "2026-11-20",
+  "paper_code_commit": "563fb637daa7a6635cdbe4412f2a0075c715893b",
+  "note": "pipeline_files holds the SHA-256 of each file that trains or evaluates a model, as it is at source_commit. tests/test_origin.py compares the files with these values.",
+  "pipeline_files": {
+    "dynamics/config.py": "21610c09c45090c8ebcc58997eb7ee20d3e31ab6f2cd292fee2e2bce3a859c5c",
+    "dynamics/data.py": "ffa9e02d7c221d078f4febaf61f153ec62beeea02b875aae5a063e034ce33088",
+    "dynamics/descriptors.py": "d95fb09933d52c0e217ae115d0d655c80c344239c1f63a24e457f56222a5d3ba",
+    "dynamics/evaluate.py": "e0d099ee7e790f4450e59d6c4ab86ffd45455e8ec202df5ef605f22a2b6e6566",
+    "dynamics/metrics.py": "c673f83f30bebd27dc26fadb0a0f6aab29f91e57125ad90995969d7ae64af54b",
+    "dynamics/model.py": "930cbf2d078683f49b01efbd6a2ea012f4dfac52f09bcfb8a0bad2152b69829e",
+    "dynamics/paper_api.py": "96292971c36aabebd48aca3be22e71d553ad63f8161507f2750d5c0078f32d77",
+    "dynamics/run_stage.py": "ddf4bcf99f6065bfb5b8c99afd3d2ad82acbc36821fbfc05088d8bf54ccfbc6f",
+    "dynamics/scores.py": "bc22741b5bcc5847ef715f9b85635585cd3dd318f49ea6a3a3240010e379a11c",
+    "dynamics/train.py": "ecfc8a810235d3d1e176fbb7bc78c48ae5dda707136ee7e071c656c66856d971"
+  }
+}
