@@ -12,12 +12,16 @@ Direction 2 (label swing): the test row enters a small context with each label i
 turn. D2 is the negative of log(sum over labels of the probability of the forced
 label). D2-0 is the largest class probability with no added row.
 
-Each score is stored in a form that keeps the order of the rows where a
-probability rounds to 1 (protocol, run record of 2026-11-21): the log-odds for D1
-and D1max, minus the log of the probability of the other classes for D2-0, and D2
-plus the constant log(number of classes). Each form is a monotone function of the
-definition above. The TabPFN probabilities come from the raw logits in double
-precision, because `predict_proba` works in single precision.
+Each score is stored in a form that does not lose the order of the rows near a
+probability of 1 by rounding (protocol, run record of 2026-11-21): the log-odds for
+D1 and D1max, minus the log of the probability of the other classes for D2-0, and
+D2 plus the constant log(number of classes). Each form is a monotone function of
+the definition above.
+
+Known limit (protocol, run record of 2026-11-23). TabPFN-3 and TabPFN-3.5 have a
+floor on each class probability inside their decoder, so every confident row gets
+the same logits. These ties are a property of the model. The forms above do not
+remove them, and the AUROC counts each tied pair as a half.
 
     python -m dynamics.tabular_probe --only A_seed5 --out-root $DYN_ROOT ...
 
@@ -31,6 +35,7 @@ import os
 import time
 import traceback
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -140,12 +145,16 @@ def probabilities(model: Any, rows: np.ndarray, gaps: list[float] | None = None
                   ) -> np.ndarray:
     """Class probabilities of `rows` in double precision, in the order of `classes_`.
 
-    TabPFN applies its softmax in single precision, so a confident model gives
-    exactly 1 to many rows, and their order is lost. Here the raw logits go through
-    the post-processing of the model itself as a double tensor. With `gaps`, the
+    The raw logits go through the post-processing of the model itself as a double
+    tensor, so no order is lost by a softmax in single precision. With `gaps`, the
     first rows are compared with `predict_proba`: the largest difference is
     appended, and a difference above the tolerance gives `predict_proba` for all
     rows. A learner with no raw logits gives `predict_proba`.
+
+    Known limit: the comparison uses `predict_proba` of the first rows alone, and
+    the raw logits of all rows. The output of TabPFN for a row changes a little
+    with the other rows of the call, so the comparison fails for TabPFN, and its
+    scores come from `predict_proba` (development runs of 2026-11-23).
     """
     raw_logits = getattr(model, "predict_raw_logits", None)
     convert = getattr(model, "logits_to_probabilities", None)
@@ -261,6 +270,15 @@ def metric_rows(scores: dict[str, np.ndarray], layout: dict[str, slice],
     return rows
 
 
+def tied_pairs(ident: np.ndarray, ood: np.ndarray) -> float:
+    """Share of the pairs of one ID row and one OOD row that have the same value."""
+    values, counts = np.unique(ident, return_counts=True)
+    others, other_counts = np.unique(ood, return_counts=True)
+    _, first, second = np.intersect1d(values, others, return_indices=True)
+    return float((counts[first] * other_counts[second]).sum()
+                 / (len(ident) * len(ood)))
+
+
 def reduce_columns(train: np.ndarray, columns: int) -> Callable[[np.ndarray], Any]:
     """The identity, or a PCA to `columns` components fitted on the training rows."""
     if columns >= train.shape[1]:
@@ -268,6 +286,56 @@ def reduce_columns(train: np.ndarray, columns: int) -> Callable[[np.ndarray], An
     from sklearn.decomposition import PCA
 
     return PCA(n_components=columns, random_state=SEED).fit(train).transform
+
+
+@dataclass
+class Prepared:
+    """One run at its last checkpoint: features, head, and the fixed probe rows."""
+
+    epoch: int
+    n_classes: int
+    #: Penultimate features, labels, and logits of the training rows.
+    train: dict[str, torch.Tensor]
+    #: Penultimate features and logits of the probe rows, `val` first.
+    probe: torch.Tensor
+    logits: torch.Tensor
+    #: Position of each set among the probe rows, and its rows in the full set.
+    layout: dict[str, slice]
+    rows: dict[str, np.ndarray]
+    #: For each probe row of `val`: the network is correct.
+    correct: np.ndarray
+    w: torch.Tensor
+    b: torch.Tensor
+
+
+def prepare(spec: RunSpec, paths: DataPaths, out_root: Path, device: torch.device,
+            workers: int, image_size: int = IMAGE_SIZE, limit: int | None = None
+            ) -> Prepared:
+    """Load the last checkpoint of a run, extract its features, and draw the rows."""
+    folder = run_dir(out_root, spec.name)
+    epoch = max(int(p.stem.split("_")[1]) for p in (folder / "checkpoints").glob(
+        "epoch_*.pt"))
+    model, state = load_model(checkpoint_path(out_root, spec.name, epoch), device)
+    n_classes = len(state["classes"])
+    sets = evaluation_sets(paths, spec.held_out, image_size, limit, workers)
+    wanted = ["train", "val", *[name for name in OOD_SETS if name in sets]]
+    features = {name: extract(model, sets[name], device, workers=0)
+                for name in wanted}
+    rows = probe_rows({name: len(features[name]["logits"]) for name in wanted[1:]},
+                      features["val"]["labels"].numpy(), n_classes)
+    order = ["val", *[name for name in wanted[2:]]]
+    layout, start = {}, 0
+    for name in order:
+        layout[name] = slice(start, start + len(rows[name]))
+        start += len(rows[name])
+    pick = {name: torch.as_tensor(rows[name]) for name in order}
+    probe = torch.cat([features[name][PENULTIMATE][pick[name]] for name in order])
+    logits = torch.cat([features[name]["logits"][pick[name]] for name in order])
+    val = features["val"]
+    correct = (val["logits"].argmax(dim=1) == val["labels"]).numpy()[rows["val"]]
+    return Prepared(epoch, n_classes, features["train"], probe, logits, layout, rows,
+                    correct, model.fc.weight.detach().float().cpu(),
+                    model.fc.bias.detach().float().cpu())
 
 
 def note_gaps(name: str, found: list[float], gaps: dict[str, float],
@@ -292,31 +360,11 @@ def probe_run(spec: RunSpec, paths: DataPaths, out_root: Path, device: torch.dev
     The checkpoint comes from `out_root`. The scores go below `probe_root`, which is
     `out_root` if it is not given.
     """
-    folder = run_dir(out_root, spec.name)
     target = run_dir(probe_root or out_root, spec.name) / "probe"
-    epoch = max(int(p.stem.split("_")[1]) for p in (folder / "checkpoints").glob(
-        "epoch_*.pt"))
-    model, state = load_model(checkpoint_path(out_root, spec.name, epoch), device)
-    n_classes = len(state["classes"])
-    sets = evaluation_sets(paths, spec.held_out, image_size, limit, workers)
-    wanted = ["train", "val", *[name for name in OOD_SETS if name in sets]]
-    features = {name: extract(model, sets[name], device, workers=0)
-                for name in wanted}
-    train = features["train"]
-    rows = probe_rows({name: len(features[name]["logits"]) for name in wanted[1:]},
-                      features["val"]["labels"].numpy(), n_classes)
-    order = ["val", *[name for name in wanted[2:]]]
-    layout, start = {}, 0
-    for name in order:
-        layout[name] = slice(start, start + len(rows[name]))
-        start += len(rows[name])
-    pick = {name: torch.as_tensor(rows[name]) for name in order}
-    probe = torch.cat([features[name][PENULTIMATE][pick[name]] for name in order])
-    logits = torch.cat([features[name]["logits"][pick[name]] for name in order])
-    val = features["val"]
-    correct = (val["logits"].argmax(dim=1) == val["labels"]).numpy()[rows["val"]]
-    w = model.fc.weight.detach().float().cpu()
-    b = model.fc.bias.detach().float().cpu()
+    ready = prepare(spec, paths, out_root, device, workers, image_size, limit)
+    epoch, n_classes, train = ready.epoch, ready.n_classes, ready.train
+    probe, logits, layout, rows = ready.probe, ready.logits, ready.layout, ready.rows
+    order, correct, w, b = list(layout), ready.correct, ready.w, ready.b
     roster, errors = all_scores(train[PENULTIMATE], train["labels"], train["logits"],
                                 w, b, probe, logits, n_classes, device,
                                 DEFAULT_PRECISION)
@@ -423,8 +471,8 @@ def measure(spec: RunSpec, paths: DataPaths, out_root: Path, device: torch.devic
               f"pass (limit 0.1)", flush=True)
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+def add_common_arguments(parser: argparse.ArgumentParser) -> None:
+    """The arguments that every probe script has: runs, folders, data, device."""
     parser.add_argument("--stage", choices=sorted(STAGES))
     parser.add_argument("--only", nargs="+", metavar="RUN")
     parser.add_argument("--out-root", required=True,
@@ -437,27 +485,20 @@ def main() -> None:
     parser.add_argument("--extra-set", action="append", default=[],
                         metavar="NAME=DIR")
     parser.add_argument("--extra-limit", type=int, default=5000)
-    parser.add_argument("--learners", nargs="*", default=[*VERSIONS, *CONTROLS],
-                        help="learners of direction 1")
-    parser.add_argument("--plain", nargs="*", default=list(VERSIONS),
-                        help="learners of the plain prediction D2-0")
-    parser.add_argument("--swing", nargs="*", default=[PRIMARY],
-                        help="learners of the label swing D2; none skips it")
-    parser.add_argument("--swing-columns", type=int, default=SWING_COLUMNS[0],
-                        choices=SWING_COLUMNS)
-    parser.add_argument("--swing-rows", type=int, default=SWING_ROWS)
-    parser.add_argument("--measure", action="store_true",
-                        help="time gate only: time the label swing on the first run")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available()
                         else "cpu")
     parser.add_argument("--image-size", type=int, default=IMAGE_SIZE)
     parser.add_argument("--limit", type=int, help="smoke runs only: images per set")
-    args = parser.parse_args()
+
+
+def selected(args: argparse.Namespace, parser: argparse.ArgumentParser
+             ) -> tuple[list[RunSpec], DataPaths]:
+    """The runs and the data folders that the common arguments name."""
     if not args.stage and not args.only:
         parser.error("give --stage or --only")
-    specs = STAGES[args.stage] if args.stage else []
+    specs = list(STAGES[args.stage]) if args.stage else []
     if args.only:
         named = [parse_run(name) for name in args.only]
         specs = [spec for spec in specs if spec in named] if args.stage else named
@@ -469,6 +510,25 @@ def main() -> None:
                       Path(args.imagewoof_dir) if args.imagewoof_dir else None,
                       Path(args.textures_dir) if args.textures_dir else None,
                       tuple(extra), args.extra_limit)
+    return specs, paths
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    add_common_arguments(parser)
+    parser.add_argument("--learners", nargs="*", default=[*VERSIONS, *CONTROLS],
+                        help="learners of direction 1")
+    parser.add_argument("--plain", nargs="*", default=list(VERSIONS),
+                        help="learners of the plain prediction D2-0")
+    parser.add_argument("--swing", nargs="*", default=[PRIMARY],
+                        help="learners of the label swing D2; none skips it")
+    parser.add_argument("--swing-columns", type=int, default=SWING_COLUMNS[0],
+                        choices=SWING_COLUMNS)
+    parser.add_argument("--swing-rows", type=int, default=SWING_ROWS)
+    parser.add_argument("--measure", action="store_true",
+                        help="time gate only: time the label swing on the first run")
+    args = parser.parse_args()
+    specs, paths = selected(args, parser)
     out_root, device = Path(args.out_root), torch.device(args.device)
     probe_root = Path(args.probe_root) if args.probe_root else out_root
     if args.measure:

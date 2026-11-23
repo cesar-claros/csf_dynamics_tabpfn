@@ -23,7 +23,7 @@ from dynamics.analyze_e import block
 from dynamics.analyze_step0 import FAR_SETS
 from dynamics.config import parse_run
 from dynamics.scores import ALL_CSFS
-from dynamics.tabular_probe import NEAR_SETS, PRIMARY, VERSIONS
+from dynamics.tabular_probe import NEAR_SETS, PRIMARY, VERSIONS, tied_pairs
 
 HERE = Path(__file__).resolve().parent
 DEVELOPMENT = ("A_seed5", "B_seed5")
@@ -53,15 +53,6 @@ def read_results(root: Path, key: str = "metrics") -> pd.DataFrame:
                 rows.append({"run": out["run"], "recipe": parse_run(out["run"]).recipe,
                              "group": group, "score": score, "auroc": value})
     return pd.DataFrame(rows)
-
-
-def tied_pairs(ident: np.ndarray, ood: np.ndarray) -> float:
-    """Share of the pairs of one ID row and one OOD row that have the same value."""
-    values, counts = np.unique(ident, return_counts=True)
-    others, other_counts = np.unique(ood, return_counts=True)
-    _, first, second = np.intersect1d(values, others, return_indices=True)
-    return float((counts[first] * other_counts[second]).sum()
-                 / (len(ident) * len(ood)))
 
 
 def tie_shares(root: Path) -> pd.DataFrame:

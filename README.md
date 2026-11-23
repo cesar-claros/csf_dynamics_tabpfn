@@ -50,6 +50,8 @@ The protocol, with the gates and the decision rule, is in `../documentation/imag
 | `dynamics/tabular_probe.py` | Probe: OOD scores from a tabular foundation model (TabPFN) on the features of a saved checkpoint, next to the 23 roster scores (HPC). |
 | `dynamics/check_probe_env.py` | Environment gate of the probe: packages, GPU, licence, and weights (HPC). |
 | `dynamics/analyze_probe.py` | Probe analysis: regret against the roster, the decision rules, and the comparison of model versions (local). |
+| `dynamics/fewrow_probe.py` | Few-row probe: the one-class score and the roster, fitted on a few ID rows of each class (HPC). |
+| `dynamics/analyze_fewrow.py` | Few-row probe analysis: the gates on the development runs, the decision rules, and the rows that a fitted score needs (local). |
 | `dynamics/interpolation.py` | Lists the training accuracy at each checkpoint of a run, for gate I of Stage D (HPC). |
 | `dynamics/analyze_d.py` | Stage D: gates I, P, and M, and the rules for questions Q1 to Q4 (local). |
 | `tests/` | Unit tests and an end-to-end test on tiny images. No GPU needed. |
@@ -540,10 +542,10 @@ nohup python -m dynamics.tabular_probe --only A_seed5 B_seed5 --swing tabpfn_v3.
 A run that has results below `--probe-root` is skipped. To compute it again, add `--force`. This command repeats the two development runs with no label swing, in about 10 minutes for each run:
 
 ```bash
-nohup python -m dynamics.tabular_probe --only A_seed5 B_seed5 --swing --force $PROBE_ARGS > dyn_probe_dev2.log 2>&1 &
+nohup python -m dynamics.tabular_probe --only A_seed5 B_seed5 --swing --swing-columns 128 --force $PROBE_ARGS > dyn_probe_dev2.log 2>&1 &
 ```
 
-The log line of a run counts its errors. An entry `precision:<score>` in the errors of `results.json` means that the double precision probabilities did not agree with `predict_proba` of `tabpfn`, and that the score used `predict_proba`. Such a score can have ties.
+The log line of a run counts its errors. An entry `precision:<score>` in the errors of `results.json` means that the double precision probabilities did not agree with `predict_proba` of `tabpfn`, and that the score used `predict_proba`. See the known limits below.
 
 **6. Test runs,** after the settings are frozen in the protocol. Seed 0 has the label swing of all versions, seed 1 of TabPFN-3.5 only, and the other runs have none:
 
@@ -571,7 +573,42 @@ uv run python -m dynamics.analyze_probe --results-root dyn_results
 
 The report has a section "Ties". It gives, for each new score, the largest share of pairs of one ID row and one OOD row with the same value. An AUROC counts a tied pair as a half, so a share above 1% marks a score whose AUROC is not reliable.
 
-**Form of the stored scores.** `tabpfn` applies its softmax in single precision, and TabPFN-3 and TabPFN-3.5 then give exactly 1 to many rows. So the probe takes the raw logits, applies the post-processing of `tabpfn` in double precision, and stores each score in a form that keeps the order of those rows: the log-odds for D1 and D1-max, minus the log of the probability of the other classes for D2-0, and D2 plus the constant log(number of classes). Each form is a monotone function of the score of the protocol, so the AUROC is the one of the planned score with no ties. Results of this code have `score_forms` in their settings. The first development results (2026-11-21) do not have it.
+**Form of the stored scores.** The probe stores each score in a form that does not lose the order of the rows near a probability of 1 by rounding: the log-odds for D1 and D1-max, minus the log of the probability of the other classes for D2-0, and D2 plus the constant log(number of classes). Each form is a monotone function of the score of the protocol. Results of this code have `score_forms` in their settings. The first development results (2026-11-21) do not have it.
+
+**Known limits (development runs of 2026-11-23).**
+
+- **Ties of TabPFN-3 and TabPFN-3.5.** The decoder of these two versions puts a floor on each class probability (`torch.log(torch.clamp(p, min=1e-5) + 3e-5)` in `tabpfn` 10.2.0). So every confident row gets the same logits, and the log-odds of a binary task cannot exceed 10.13 (11.25 with the temperature of TabPFN-3). These ties are a property of the model. No change of precision removes them, and the AUROC counts each tied pair as a half. TabPFN-2.5 has no such floor.
+- **The self-check reports a mismatch for TabPFN.** It compares `predict_proba` of the first 256 rows alone with the raw logits of all rows. The output of TabPFN for a row changes a little with the other rows of the call (up to 0.005 in probability for TabPFN-3.5 and 0.1 for TabPFN-3), so each TabPFN score gets an entry `precision:<score>` and comes from `predict_proba`. This does not change the reading, because the ties come from the floor.
+
+### Few-row probe: scores fitted on a few ID rows
+
+The plan is `../documentation/few_row_probe_protocol_2026-11-23.md`. It uses the image, the folders, and `PROBE_ARGS` of the probe above. For each run, it draws 10, 30, and 100 training rows of each class, three times each, and it fits on these rows the roster and the one-class score D1 with each learner. One more arm fits the roster and the two controls on all training rows. The results go to `runs/<run>/fewrow/results.json` below `--probe-root`.
+
+**1. Development runs,** about 20 minutes for each run by my estimate:
+
+```bash
+nohup python -m dynamics.fewrow_probe --only A_seed5 B_seed5 $PROBE_ARGS > dyn_fewrow_dev.log 2>&1 &
+```
+
+```bash
+cd "$DYN_TABPFN_ROOT" && tar czf dyn_fewrow.tgz runs/*/fewrow
+```
+
+**2. Gates,** local, after `tar xzf dyn_fewrow.tgz -C dyn_results`. The report goes to `dynamics/outputs/fewrow_report.md`. It gives the sanity gate, the futility gate, and the time for the test runs. The test runs start only if the report says "continue":
+
+```bash
+uv run python -m dynamics.analyze_fewrow --results-root dyn_results
+```
+
+**3. Test runs,** the 18 runs of the recipes C1 to C6. Add `--draws 1` if the time gate asks for it:
+
+```bash
+nohup python -m dynamics.fewrow_probe --only C1_seed0 C2_seed0 C3_seed0 C4_seed0 C5_seed0 C6_seed0 C1_seed1 C2_seed1 C3_seed1 C4_seed1 C5_seed1 C6_seed1 C1_seed2 C2_seed2 C3_seed2 C4_seed2 C5_seed2 C6_seed2 $PROBE_ARGS > dyn_fewrow_test.log 2>&1 &
+```
+
+Then pack and analyze as in steps 1 and 2. The same analysis command reads the test runs and applies the two rules.
+
+The log line of a run counts the errors of all its arms. A feature score of the roster can fail with few rows, and the analysis then leaves it out and names it.
 
 ### Reference check on saved checkpoints
 
