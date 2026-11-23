@@ -219,6 +219,23 @@ def test_probe_on_a_tiny_run(tiny_data, tmp_path, monkeypatch):
     assert saved["values"].shape == (len(saved["names"]), 120 + 20 + 18 + 60)
     assert saved["values"].dtype == np.float64
     tp.main()          # a complete run is skipped
+    # With --probe-root, the checkpoint is read in the run folder and the results
+    # go to the other folder.
+    other = tmp_path / "probe_only"
+    (folder / "results.json").unlink()
+    monkeypatch.setattr("sys.argv", [
+        "tabular_probe", "--only", "B_seed0", "--learners", "logistic", "--plain",
+        "--swing", "--extra-limit", "20", "--probe-root", str(other),
+        "--extra-set", f"places={extra / 'places'}", *common])
+    tp.main()
+    moved = other / "runs" / "B_seed0" / "probe"
+    assert sorted(path.name for path in moved.iterdir()) == ["results.json",
+                                                             "scores.npz"]
+    assert not (folder / "results.json").exists()
+    assert not (other / "runs" / "B_seed0" / "checkpoints").exists()
+    again = json.loads((moved / "results.json").read_text())
+    assert "D1:logistic" in {row["score"] for row in again["metrics"]}
+    assert "D2:logistic" not in {row["score"] for row in again["swing_metrics"]}
 
 
 def write_results(root, run: str, far: dict[str, float], swing: dict[str, float]

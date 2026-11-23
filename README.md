@@ -515,10 +515,14 @@ python -m dynamics.check_probe_env
 python -m dynamics.check_probe_env --load
 ```
 
-**3. Common arguments.** Set `OOD` as for step 0:
+**3. Common arguments.** Set `OOD` as for step 0. The probe reads the checkpoints of the trained runs below `--out-root`, and it writes its results below `--probe-root`, in `runs/<run>/probe/`. So the folder of the trained runs gets no new file. Set `DYN_TABPFN_ROOT` to a folder of this project. With no `--probe-root`, the results go below `--out-root`:
 
 ```bash
-export PROBE_ARGS="--out-root $DYN_ROOT --imagenette-dir $IMAGENETTE_DIR --imagewoof-dir $IMAGEWOOF_DIR --textures-dir $TEXTURES_DIR --extra-set inaturalist=$OOD/inaturalist --extra-set places=$OOD/places --extra-set sun=$OOD/sun --extra-set openimage_o=$OOD/openimage_o --extra-set ssb_hard=$OOD/ssb_hard --extra-set ninco=$OOD/ninco"
+export DYN_TABPFN_ROOT=/path/to/csf_dynamics_tabpfn_runs
+```
+
+```bash
+export PROBE_ARGS="--out-root $DYN_ROOT --probe-root $DYN_TABPFN_ROOT --imagenette-dir $IMAGENETTE_DIR --imagewoof-dir $IMAGEWOOF_DIR --textures-dir $TEXTURES_DIR --extra-set inaturalist=$OOD/inaturalist --extra-set places=$OOD/places --extra-set sun=$OOD/sun --extra-set openimage_o=$OOD/openimage_o --extra-set ssb_hard=$OOD/ssb_hard --extra-set ninco=$OOD/ninco"
 ```
 
 **4. Time gate.** It prints the seconds for one pass of the label swing with 512 and with 128 columns. The limit is 0.1 second. The probe turns on the model cache of `tabpfn` (`TABPFN_MODEL_CACHE_SIZE`), unless the variable is set, because `tabpfn` builds the network again at each fit without it:
@@ -533,7 +537,7 @@ python -m dynamics.tabular_probe --only A_seed5 --measure $PROBE_ARGS
 nohup python -m dynamics.tabular_probe --only A_seed5 B_seed5 --swing tabpfn_v3.5 tabpfn_v3 tabpfn_v2.5 --swing-columns 128 --swing-rows 125 $PROBE_ARGS > dyn_probe_dev.log 2>&1 &
 ```
 
-A run that has results is skipped. To compute it again, add `--force`. This command repeats the two development runs with no label swing, in about 10 minutes for each run:
+A run that has results below `--probe-root` is skipped. To compute it again, add `--force`. This command repeats the two development runs with no label swing, in about 10 minutes for each run:
 
 ```bash
 nohup python -m dynamics.tabular_probe --only A_seed5 B_seed5 --swing --force $PROBE_ARGS > dyn_probe_dev2.log 2>&1 &
@@ -556,7 +560,7 @@ nohup python -m dynamics.tabular_probe --only C1_seed2 C2_seed2 C3_seed2 C4_seed
 ```
 
 ```bash
-cd "$DYN_ROOT" && tar czf dyn_probe.tgz runs/*/probe
+cd "$DYN_TABPFN_ROOT" && tar czf dyn_probe.tgz runs/*/probe
 ```
 
 Local analysis, after `tar xzf dyn_probe.tgz -C dyn_results`. The report goes to `dynamics/outputs/probe_report.md`:

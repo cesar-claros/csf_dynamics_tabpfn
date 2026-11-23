@@ -285,9 +285,15 @@ def note_gaps(name: str, found: list[float], gaps: dict[str, float],
 def probe_run(spec: RunSpec, paths: DataPaths, out_root: Path, device: torch.device,
               learners: list[str], plain: list[str], swing: list[str],
               swing_columns: int, swing_rows: int, workers: int,
-              image_size: int = IMAGE_SIZE, limit: int | None = None) -> dict:
-    """All scores of one run on its probe rows, as a JSON-ready dict."""
+              image_size: int = IMAGE_SIZE, limit: int | None = None,
+              probe_root: Path | None = None) -> dict:
+    """All scores of one run on its probe rows, as a JSON-ready dict.
+
+    The checkpoint comes from `out_root`. The scores go below `probe_root`, which is
+    `out_root` if it is not given.
+    """
     folder = run_dir(out_root, spec.name)
+    target = run_dir(probe_root or out_root, spec.name) / "probe"
     epoch = max(int(p.stem.split("_")[1]) for p in (folder / "checkpoints").glob(
         "epoch_*.pt"))
     model, state = load_model(checkpoint_path(out_root, spec.name, epoch), device)
@@ -369,8 +375,9 @@ def probe_run(spec: RunSpec, paths: DataPaths, out_root: Path, device: torch.dev
             errors[f"D2:{name}"] = f"{type(error).__name__}: {error}"
             print(traceback.format_exc(), flush=True)
         timing[f"D2:{name}"] = round(time.time() - began, 1)
+    target.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
-        folder / "probe" / "scores.npz", names=np.array(list(scores)),
+        target / "scores.npz", names=np.array(list(scores)),
         values=np.stack(list(scores.values())).astype(np.float64),
         sets=np.array(order), bounds=np.array([layout[name].stop for name in order]),
         correct=correct, swing_rows=chosen,
@@ -420,7 +427,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--stage", choices=sorted(STAGES))
     parser.add_argument("--only", nargs="+", metavar="RUN")
-    parser.add_argument("--out-root", required=True)
+    parser.add_argument("--out-root", required=True,
+                        help="folder of the trained runs: the checkpoints are read here")
+    parser.add_argument("--probe-root",
+                        help="folder for the probe results; default: --out-root")
     parser.add_argument("--imagenette-dir", "--id-dir", required=True)
     parser.add_argument("--imagewoof-dir")
     parser.add_argument("--textures-dir")
@@ -460,12 +470,13 @@ def main() -> None:
                       Path(args.textures_dir) if args.textures_dir else None,
                       tuple(extra), args.extra_limit)
     out_root, device = Path(args.out_root), torch.device(args.device)
+    probe_root = Path(args.probe_root) if args.probe_root else out_root
     if args.measure:
         measure(specs[0], paths, out_root, device, args.workers)
         return
     failures = []
     for spec in specs:
-        target = run_dir(out_root, spec.name) / "probe" / "results.json"
+        target = run_dir(probe_root, spec.name) / "probe" / "results.json"
         if target.exists() and not args.force:
             print(f"[probe] {spec.name}: done, skipped", flush=True)
             continue
@@ -474,7 +485,7 @@ def main() -> None:
         try:
             out = probe_run(spec, paths, out_root, device, args.learners, args.plain,
                             args.swing, args.swing_columns, args.swing_rows,
-                            args.workers, args.image_size, args.limit)
+                            args.workers, args.image_size, args.limit, probe_root)
         except Exception:  # noqa: BLE001 - continue with the next run
             failures.append(spec.name)
             print(f"[probe] {spec.name} FAILED\n{traceback.format_exc()}", flush=True)
