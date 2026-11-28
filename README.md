@@ -52,6 +52,7 @@ The protocol, with the gates and the decision rule, is in `../documentation/imag
 | `dynamics/analyze_probe.py` | Probe analysis: regret against the roster, the decision rules, and the comparison of model versions (local). |
 | `dynamics/fewrow_probe.py` | Few-row probe: the one-class score and the roster, fitted on a few ID rows of each class (HPC). |
 | `dynamics/analyze_fewrow.py` | Few-row probe analysis: the gates on the development runs, the decision rules, and the rows that a fitted score needs (local). |
+| `dynamics/fit_tables.py` | Learner swap for the selection rule: fits TabPFN regressors, a random forest, and a ridge regression on tables that the main repository exports, and writes the predictions (HPC). |
 | `dynamics/interpolation.py` | Lists the training accuracy at each checkpoint of a run, for gate I of Stage D (HPC). |
 | `dynamics/analyze_d.py` | Stage D: gates I, P, and M, and the rules for questions Q1 to Q4 (local). |
 | `tests/` | Unit tests and an end-to-end test on tiny images. No GPU needed. |
@@ -609,6 +610,18 @@ nohup python -m dynamics.fewrow_probe --only C1_seed0 C2_seed0 C3_seed0 C4_seed0
 Then pack and analyze as in steps 1 and 2. The same analysis command reads the test runs and applies the two rules.
 
 The log line of a run counts the errors of all its arms. A feature score of the roster can fail with few rows, and the analysis then leaves it out and names it.
+
+### TabPFN as the selection rule: fits on exported tables
+
+The plan is `../documentation/tabpfn_rule_check_2026-11-27.md`. The main repository (`csf_dynamics`) writes the tables of the rule with `python -m dynamics.analyze_tabrule export`. This script knows only those tables. For each fit it trains one regressor for each of the 23 targets and predicts the test rows. The learners are `tabpfn_v3.5` (the one of the verdict), `tabpfn_v2.5`, `tabpfn_v3.5_weighted` (with the row weights of the ridge fit), `forest` (a random forest with 500 trees), and `ridge` (the check of the path).
+
+Copy `rule_tables.npz` to the HPC, and run in the TabPFN image, with `TABPFN_TOKEN` set as for the probe:
+
+```bash
+nohup python -m dynamics.fit_tables --tables rule_tables.npz --out rule_predictions.npz > dyn_fit_tables.log 2>&1 &
+```
+
+The tables have 56 fits, so each learner has 1,288 regressors with at most 186 rows and 69 columns. The file of the predictions is written after each fit. A second start with the same `--out` continues where the first one stopped. The script refuses an `--out` file that belongs to other tables. Copy `rule_predictions.npz` back for the read in the main repository.
 
 ### Reference check on saved checkpoints
 
